@@ -2,10 +2,21 @@
   "name": "inventor",
   "version": "1.0.0",
   "description": "inventor bot",
-  "main": "src/bot.js",
+  "main": "src/start.js",
+  "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "@langchain/openai": "^0.2.6",
+    "@langchain/redis": "^0.0.5",
+    "langchain": "^0.2.13",
+    "node-telegram-bot-api": "^0.66.0",
+    "objectid": "^3.2.1",
+    "redis": "^4.7.0",
+    "replicate": "^0.32.0",
+    "telegramify-markdown": "^1.2.2"
+  }
 }
