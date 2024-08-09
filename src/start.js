@@ -1,10 +1,12 @@
 
-import { bot } from './bot/index.js';
+import TelegramThread from 'telegramthread';
 import { NewPhotoThread, SearchThread } from './threads/index.js';
 
 const users = [
     215640362
 ]
+
+const bot = new TelegramThread();
 
 bot.onMessage(async (message) => {
     if (!users.includes(message.from.id)) {

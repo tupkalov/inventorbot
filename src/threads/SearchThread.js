@@ -1,4 +1,4 @@
-import AbstractThread from './AbstractThread.js';
+import { AbstractThread } from 'telegramthread';
 
 import { imageDescriptionVectorStore, imageVectorStore } from '../ai/VectorStore.js';
 
