@@ -1,6 +1,8 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage } from "@langchain/core/messages";
 
+/** Модель для общения текстом */
+
 export default class AI {
     static visionModel = new ChatOpenAI({
                             model: "gpt-4o-mini",

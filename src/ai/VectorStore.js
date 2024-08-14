@@ -2,26 +2,14 @@ import { RedisVectorStore } from "@langchain/redis";
 import { OpenAIEmbeddings } from "@langchain/openai";
 import ReplicateImageEmbeddings from "./ReplicateImageEmbeddings.js";
 
-import { createClient } from "redis";
-
-
-
-const client = createClient({
-    url: 'redis://redis:6379'
-});
-
-client.connect().then(() => {
-   console.log("Connected to Redis"); 
-}, (error) => {
-    console.error(error);
-    process.exit(1);
-});
+import { redisClient } from "../redis/index.js";
 
 export default class VectorStore {
+    
     constructor (indexName, embeddings) {
         this.indexName = indexName;
         this.instance = new RedisVectorStore(embeddings, {
-            redisClient: client,
+            redisClient,
             indexName,
         });
     }
@@ -35,11 +23,15 @@ export default class VectorStore {
         });
     }
 
+    async saveMetadataByFileId (fileId, metadata) {
+        return await redisClient.HSET(`doc:${this.indexName}:${fileId}`, 'metadata', this.instance.escapeSpecialChars(JSON.stringify(metadata)));
+    }
+
     async query (queryText, { count = 3, score } = {}) {
         const results = await this.instance.similaritySearchWithScore(queryText, count);
 
         return results.reduce((acc, [doc, _score]) => {
-            if (_score <= score) {
+            if (!score || _score <= score) {
                 acc.push(doc);
             }
             return acc;
@@ -48,14 +40,17 @@ export default class VectorStore {
 
     async getByFileIds (fileIds) {
         const keys = fileIds.map((fileId) => `doc:${this.indexName}:${fileId}`);
-        const docs = await Promise.all(keys.map(key => client.HGETALL(key)));
+        const docs = await Promise.all(keys.map(key => redisClient.HGETALL(key)));
         return docs.filter(({ content }) => content).map(({ metadata, content }) => {
             return {
                 metadata: JSON.parse(this.instance.unEscapeSpecialChars((metadata ?? "{}"))),
                 pageContent: content
             };
-            
         });
+    }
+
+    async deleteByFileId (fileId) {
+        await redisClient.DEL(`doc:${this.indexName}:${fileId}`);
     }
 }
 
