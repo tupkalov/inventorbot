@@ -4,23 +4,46 @@ import SearchItem from '../models/SearchItem.js';
 
 export default class NewPhotoThread extends AbstractThread {
 
-    async processing(startMessage, getNextMessage) {
-        const fileId = startMessage.getLastPhoto().file_id;
+    async processing(photoMessage, getNextMessage) {
+        const fileId = photoMessage.getLastPhoto().file_id;
         const url = await this.bot.getFileLink(fileId);
-        const aiDialog = new ImageDescriptionDialog(url);
-        let imageDescription = await aiDialog.getImageDescription();
 
         // Главная модель
-        const searchItem = new SearchItem(fileId, imageDescription, { saved: false, bot: this.bot });
-        searchItem.once('save', () => this.stop());
+        var searchItemData;
+        const firstController = new AbortController();
 
-        await searchItem.sendDescription(startMessage.chat);
+        // Флаг что нужно сохранить после получения данных
+        let save = false;
+        if (photoMessage.caption) save = true; // Сохраняем сразу если есть описание
+        
+        searchItemData = await Promise.any([
+            // Получение сразу после фото
+            (async () => {
+                const aiDialog = new ImageDescriptionDialog(url, { edit: photoMessage.caption });
+                try {
+                    return await aiDialog.getImageDescription({ signal: firstController.signal });
+                } catch (e) {
+                    if (e.name === "AbortError") throw e;
+                    this.stop(error)
+                }
+            })(),
 
-        while (true) {
-            const editMessage = await getNextMessage(); // getNextMessage выкинет завершение диалога если начнется новый в этом чате
-            imageDescription = await aiDialog.askWith(`Поправь описание фото в соответствии со следующими комментариями: \n${editMessage.text}`);
-
-            await searchItem.updateImageDescription(imageDescription);
-        }
+            // Если пришло еще сообщение то переделываем запрос
+            (async () => {
+                const nextMessage = await getNextMessage();
+                if (searchItemData) return;
+                save = true; // Сохраняем после получения данных
+                firstController.abort();
+                const aiDialog = new ImageDescriptionDialog(url, {
+                    edit: [photoMessage.caption, nextMessage.text].filter(Boolean).join("\n")
+                });
+                return await aiDialog.getImageDescription();
+            })()
+        ]);
+        
+        const searchItem = new SearchItem(fileId, searchItemData, { saved: false, bot: this.bot, url });
+        if (save) await searchItem.save();
+        const descriptionMessage = await searchItem.sendDescriptionTo(this.chat);
+        if (!save) return descriptionMessage.edit();
     }
 }

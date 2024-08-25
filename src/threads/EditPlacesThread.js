@@ -3,31 +3,31 @@ import { redisClient, getPlaces } from '../redis/index.js';
 
 
 export default class EditPlacesThread extends AbstractThread {
-    async processing(startMessage, getNextMessage) {
+    async processing(getNextMessage) {
         const currentPlaces = await getPlaces();
         if (!currentPlaces.length) {
-            await this.sendMessage("Местоположения не установлены");
+            await this.chat.sendText("Местоположения не установлены");
         } else {
-            await this.sendMessage("Текущие местоположения:");
-            await this.sendMessage(currentPlaces.join("\n"));
+            await this.chat.sendText("Текущие местоположения:");
+            await this.chat.sendText(currentPlaces.join("\n"));
         }
 
-        await this.sendMessage("Введите новые местоположения. Каждое местоположение на новой строке. или введите /cancel для отмены");
+        await this.chat.sendText("Введите новые местоположения. Каждое местоположение на новой строке. или введите /cancel для отмены");
 
         const answer = await getNextMessage();
         if (answer.is('/cancel')) {
-            await this.sendMessage("Отменено");
+            await this.chat.sendText("Отменено");
             return;
         }
 
         if (!answer.text) {
-            await this.sendMessage("Вы не ввели местоположения");
+            await this.chat.sendText("Вы не ввели местоположения");
             return;
         }
 
         const newPlaces = answer.text.split("\n").map((place) => place.trim());
         await redisClient.DEL("places");
         await redisClient.SADD("places", newPlaces);
-        await this.sendMessage("Местоположения обновлены");
+        await this.chat.sendText("Местоположения обновлены");
     }
 }

@@ -16,6 +16,6 @@
     "openai": "^4.55.3",
     "redis": "^4.7.0",
     "replicate": "^0.32.0",
-    "zod": "^3.23.8"
+    "telegramthread": "^0.1.6"
   }
 }

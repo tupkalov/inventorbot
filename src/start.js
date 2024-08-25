@@ -1,35 +1,35 @@
 
-import TelegramThread from 'telegramthread';
+import { Bot } from 'telegramthread';
 import { NewPhotoThread, SearchThread, EditPlacesThread } from './threads/index.js';
 
-const users = [
-    215640362
-]
+if (!process.env.RESTRICTED_USERS) {
+    throw new Error('RESTRICTED_USERS is not defined');
+}
+const users = process.env.RESTRICTED_USERS.split(',').map(Number);
 
-const bot = global.bot = new TelegramThread();
+const bot = global.bot = new Bot();
+bot.start();
 
-bot.onMessage(async (message) => {
+bot.onMessage(async (message, chat) => {
     if (!users.includes(message.from.id)) {
-        return message.reply('You are not allowed to use this bot');
+        return chat.sendText('You are not allowed to use this bot');
     }
 
     if (message.is('/start')) {
-        return message.reply('Send a photo!');
+        return chat.sendText('Пришлите фотографию чтобы добавить новый объект или вызовите команду из меню.');
     }
     
-    else if (message.isPhoto() && !message.chat.thread?.isWaitingImage()) {
-        return message.startThread(NewPhotoThread);
-
+    else if (message.isPhoto() && !chat.thread?.isWaitingImage()) {
+        return chat.startThread(NewPhotoThread, message);
     } else if (message.is('/search')) {
-        return message.startThread(SearchThread);
+        return chat.startThread(SearchThread);
         
     } else if (message.is('/editplaces')) {
-        return message.startThread(EditPlacesThread);
+        return chat.startThread(EditPlacesThread);
     }
 });
 
 
 process.on("SIGTERM", () => {
-    bot.stopPolling();
     process.exit();
 });

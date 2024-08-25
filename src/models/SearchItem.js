@@ -2,54 +2,101 @@ import DescriptionMessage from "./DescriptionMessage.js";
 import { EventEmitter } from 'node:events';
 import { imageDescriptionVectorStore, imageVectorStore } from '../ai/VectorStore.js';
 import { getPlaces } from '../redis/index.js';
+import { ToolInputParsingException } from "@langchain/core/tools";
+import { ImageDescriptionDialog } from '../ai/AI.js';
+import { ObjectId } from "telegramthread";
 
 export default class SearchItem extends EventEmitter {
-    constructor (fileId, pageContent, { metadata, saved }) {
+    constructor (fileId, pageContent, { metadata, saved, url }) {
         super();
 
         if (typeof saved !== "boolean") throw new Error("options.saved is required");
 
-        this.data = {
-            metadata: {
-                ...metadata,
-                fileId
-            },
-            pageContent
-        };
+        this.updateByData(pageContent, { metadata, fileId, updateMessages: false });
 
-        Object.assign(this, { saved });
+        Object.assign(this, { saved, url });
+    }
+
+    async updateByData (pageContent, { metadata, fileId, updateMessages = ToolInputParsingException } = {}) {
+        if (typeof pageContent === "string") {
+            // Пытаемся вынуть JSON из строки
+            try {
+                this.data = JSON.parse(pageContent);
+            } catch (e) {
+                this.data = { description: pageContent };
+            }
+        } else if (typeof pageContent === "object") {
+            this.data = pageContent;
+        }
+
+        if (metadata?.id) this.id = metadata.id;
+        if (!this.id) this.id = new ObjectId().toString();
+
+        if (metadata?.fileId || fileId) this.fileId = metadata?.fileId || fileId;
+
+        if (updateMessages) await this.updateMessages();
+    }
+
+    toJSON () {
+        return {
+            metadata: this.metadata,
+            pageContent: this.data
+        };
     }
 
     get bot() {
         return global.bot
     }
 
-    get imageDescription () {
-        return this.data.pageContent
-    }
-
-    set imageDescription (description) {
-        this.data.pageContent = description;
-    }
-
     get metadata () {
-        return this.data.metadata;
-    }
-
-    get fileId () {
-        return this.data.metadata.fileId;
+        return { fileId: this.fileId, id: this.id };
     }
 
     get place () {
-        return this.data.metadata.place;
+        return this.data.place;
     }
 
     set place (place) {
-        this.data.metadata.place = place;
+        this.data.place = place;
     }
 
-    // Получить список всех мест
-    static getPlaces = getPlaces
+    get shortName () {
+        return this.data.shortName;
+    }
+
+    get description () {
+        return this.data.description;
+    }
+
+    get markdownDescriptionText () {
+        var text = '';
+        if (this.shortName) text += `📦 **${this.shortName}**\n`;
+        text += this.description;
+        return text;
+    }
+    
+    get descriptionText () {
+        var text = '';
+        if (this.shortName) text += `📦 ${this.shortName}\n`;
+        text += this.description;
+        return text;
+    }
+
+    getMediaCaption () {
+        var { descriptionText } = this;
+        if (descriptionText.length > 1024) {
+            descriptionText = descriptionText.slice(0, 1020).trim() + '...';
+        }
+        return descriptionText;
+    }
+
+    async getUrl () {
+        return this.url || (this.url = await this.bot.getFileLink(this.fileId));
+    }
+
+    edit() {
+        this.inEdit = true;
+    }
 
     // Список всех мест даже если нет в базе выбранной
     async getPlaces () {
@@ -57,7 +104,7 @@ export default class SearchItem extends EventEmitter {
         if (this.place) {
             places.add(this.place);
         }
-        for (let place of await this.constructor.getPlaces()) {
+        for (let place of await getPlaces()) {
             places.add(place);
         }
         return [...places]
@@ -70,7 +117,7 @@ export default class SearchItem extends EventEmitter {
             throw MessageError(`FileId in imageDescriptionVectorStore not found: ${this.fileId}`, { clientMessage: "Изображение не найдено" });
         }
 
-        this.data = searchItemData;
+        this.updateByData(searchItemData.pageContent, searchItemData.metadata);
     }
     
     async savePlace (place) {
@@ -78,34 +125,22 @@ export default class SearchItem extends EventEmitter {
         if (this.saved) {
             await this.fetchData();
             this.place = place;
-            await imageDescriptionVectorStore.saveMetadataByFileId(this.fileId, this.metadata);
+            this.save();
         } else {
             this.place = place;
         }
 
-        await this.updateButtons()
-    }
-
-
-    async updateImageDescription (imageDescription) {
-        this.imageDescription = imageDescription;
-        for (const descriptionMessage of this.constructor.getDescriptionMessages(this.fileId)) {
-            await descriptionMessage.updateText();
-        }
-    }
-
-    async updateButtons () {
-        for (const descriptionMessage of this.constructor.getDescriptionMessages(this.fileId)) {
-            await descriptionMessage.updateButtons();
-        }
+        await this.updateMessages()
     }
 
     // Создание нового описани, отправка и сохранение ссылки в кэше
-    async sendDescription (chat) {
-        const description = DescriptionMessage.createInChat(chat, { text: this.imageDescription, searchItem: this });
+    async sendDescriptionTo (chat) {
+        const descriptionMessage = new DescriptionMessage({}, { chat, searchItem: this });
+
         // Список всех описаний для данного файла
-        this.descriptionStack = this.constructor.addDescriptionMessage(description);
-        await description.send();
+        this.constructor.addDescriptionMessage(descriptionMessage);
+        await descriptionMessage.send();
+        return descriptionMessage;
     }
 
     async sendPhoto (chat) {
@@ -113,19 +148,28 @@ export default class SearchItem extends EventEmitter {
     }
 
     async save () {
+        if (!this.saved) return this.saveNew();
+        
+        await imageDescriptionVectorStore.save(this.fileId, this.toJSON());
+        this.emit('save');
+
+        await this.updateMessages();
+    }
+
+    async saveNew () {
         if (this.saved) throw new Error("Already saved");
 
-        await imageDescriptionVectorStore.saveImage(this.fileId, this.imageDescription);
+        const newData = await imageDescriptionVectorStore.saveNew(this.fileId, this.toJSON());
+        this.updateByData(newData.pageContent, { metadata: newData.metadata });
 
         const imageUrl = await this.bot.getFileLink(this.fileId);
-        await imageVectorStore.saveImage(this.fileId, imageUrl);
+        await imageVectorStore.saveNew(this.fileId, { pageContent: imageUrl, metadata: { fileId: this.fileId } });
+
 
         this.saved = true;
         this.emit('save');
 
-        for (const descriptionMessage of this.constructor.getDescriptionMessages(this.fileId)) {
-            await descriptionMessage.updateButtons();
-        }
+        await this.updateMessages();
     }
 
     async delete () {
@@ -133,9 +177,7 @@ export default class SearchItem extends EventEmitter {
         await imageVectorStore.deleteByFileId(this.fileId);
         this.saved = false;
 
-        for (const descriptionMessage of this.constructor.getDescriptionMessages(this.fileId)) {
-            await descriptionMessage.updateButtons()
-        }
+        await this.updateMessages();
     }
     
 
@@ -160,7 +202,7 @@ export default class SearchItem extends EventEmitter {
 
     static map = new Map();
 
-    static get ({ metadata, pageContent }) {
+    static builder ({ metadata, pageContent }) {
         const fileId = metadata.fileId;
         var searchItem = this.map.get(fileId);
         if (!searchItem) {
@@ -168,5 +210,28 @@ export default class SearchItem extends EventEmitter {
             this.map.set(fileId, searchItem);
         }
         return searchItem;
+    }
+
+    updateMessages () {
+        return Promise.all(this.constructor.getDescriptionMessages(this.fileId).map(
+            (descriptionMessage) => descriptionMessage.update()
+        ));
+    }
+
+    async getImageDescriptionDialog() {
+        return new ImageDescriptionDialog(await this.getUrl(), { result: JSON.stringify(this.data) });
+    }
+
+    getMediaPhoto(options) {
+        var caption = this.getMediaCaption();
+        if (typeof options.caption === 'function') {
+            caption = options.caption(caption);
+        }
+
+        return {
+            type: 'photo',
+            media: this.fileId,
+            caption
+        };
     }
 }

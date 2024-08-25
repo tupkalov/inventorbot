@@ -3,39 +3,60 @@ import { OpenAIEmbeddings } from "@langchain/openai";
 import ReplicateImageEmbeddings from "./ReplicateImageEmbeddings.js";
 
 import { redisClient } from "../redis/index.js";
-
 export default class VectorStore {
     
     constructor (indexName, embeddings) {
-        this.indexName = indexName;
+        this.userPrefix = process.env.REDIS_PREFIX;
+
+        this.indexName = this.userPrefix 
+            ? `${this.userPrefix}${indexName.charAt(0).toUpperCase()}${indexName.slice(1)}`
+            : indexName;
+
         this.instance = new RedisVectorStore(embeddings, {
             redisClient,
-            indexName,
+            indexName: this.indexName,
         });
     }
 
-    async saveImage (fileId, description) {
+    async saveNew (key, { pageContent, metadata }) {
         await this.instance.addDocuments([{
-            metadata: { fileId },
-            pageContent: description,
+            metadata,
+            pageContent: typeof pageContent !== "string" ? JSON.stringify(pageContent) : pageContent,
         }], {
-            keys: [`doc:${this.indexName}:${fileId}`],
+            keys: [`doc:${this.indexName}:${key}`],
         });
+
+        if (metadata.id) await this.setId(metadata.id, key);
+
+        return { pageContent, metadata };
     }
 
-    async saveMetadataByFileId (fileId, metadata) {
-        return await redisClient.HSET(`doc:${this.indexName}:${fileId}`, 'metadata', this.instance.escapeSpecialChars(JSON.stringify(metadata)));
+    async setId (id, key) {
+        const objectIdPrefix = this.userPrefix ? `${this.userPrefix}Objectid:` : "objectid:";
+        const keyPrefix = this.userPrefix ? `${this.userPrefix}Key:` : "key:";
+
+        await redisClient.SET(objectIdPrefix + id, key);
+        await redisClient.SET(keyPrefix + key, id.toString());
     }
 
-    async query (queryText, { count = 3, score } = {}) {
-        const results = await this.instance.similaritySearchWithScore(queryText, count);
+    async save (key, { metadata, pageContent }) {
+        await redisClient.HSET(`doc:${this.indexName}:${key}`, 'metadata', this.instance.escapeSpecialChars(JSON.stringify(metadata)));
+        await redisClient.HSET(`doc:${this.indexName}:${key}`, 'content', JSON.stringify(pageContent));
+        return;
+    }
 
-        return results.reduce((acc, [doc, _score]) => {
-            if (!score || _score <= score) {
-                acc.push(doc);
-            }
-            return acc;
-        }, []);
+    async query (queryText, { count = 10 } = {}) {
+        let results = await this.instance.similaritySearchWithScore(queryText, count);
+
+        const thresold = .8;
+        const maxBelowThresold = 3;
+        const filteredResults = results.filter(([ , score ]) => score <= thresold);
+
+        if (filteredResults.length >= maxBelowThresold) {
+            results = filteredResults;
+        }
+
+        return results.map(([ doc ]) => doc);
     }
 
     async getByFileIds (fileIds) {

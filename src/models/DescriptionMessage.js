@@ -1,5 +1,6 @@
 
 import { Message, utils } from 'telegramthread';
+import EditSearchItemThread from '../threads/EditSearchItemThread.js';
 
 export default class DescriptionMessage extends Message {
     constructor (data, { searchItem }) {
@@ -19,8 +20,15 @@ export default class DescriptionMessage extends Message {
         return this.searchItem.place;
     }
 
+    get text () {
+        return this.searchItem.descriptionText;
+    }
 
-    // Сгенерировать кнопки из списка мест
+    get markdownText () {
+        return this.searchItem.markdownDescriptionText;
+    }
+
+     // Сгенерировать кнопки из списка мест
     async getPlacesButtons () {
         return (await this.searchItem.getPlaces())
             .map((place) => ({
@@ -28,7 +36,7 @@ export default class DescriptionMessage extends Message {
                 action: async () => {
                     if (this.place === place) {
                         this.showPlaces = false;
-                        await this.updateButtons();
+                        await this.update();
                         return;
                     }
                     this.showPlaces = false;
@@ -39,7 +47,7 @@ export default class DescriptionMessage extends Message {
     }
 
     get saveDeleteRows () {
-        if (!this.saved) {
+        if (!this.saved || this.inEdit) {
             return [[{ text: "💾 Сохранить", action: async () => {
                 await this.searchItem.save();
                 return "Сохранено";
@@ -47,10 +55,16 @@ export default class DescriptionMessage extends Message {
 
         } else {
             // Удаление
-            return [[{ text: "❌ Удалить", action: async () => {
-                await this.searchItem.delete();
-                return "Удалено";
-            }}]]
+            return [
+                [{ text: "📝 Редактировать", action: async () => {
+                    await this.edit();
+                    return "Редактирование начато. Отправьте новое описание";
+                }},
+                { text: "❌ Удалить", action: async () => {
+                    await this.searchItem.delete();
+                    return "Удалено";
+                }}]
+            ]
         }
     }
 
@@ -58,13 +72,13 @@ export default class DescriptionMessage extends Message {
     async getKeyboard () {
         return this.inlineKeyboard = [
             
-            ...(this.showPlaces || !this.saved
+            ...(this.showPlaces
                 // Рисуем список с выбором места
                 ? utils.createInlineRows(await this.getPlacesButtons())
                 // Или рисуем кнопку для открытия списка мест
                 : [[{ text: this.place ? `📍 ${this.place}` : "📍 Место не указано", action: async () => {
                     this.showPlaces = true;
-                    await this.updateButtons();
+                    await this.update();
                     return "Выберите новое местоположение";
                 }}]]
             ),
@@ -72,20 +86,26 @@ export default class DescriptionMessage extends Message {
         ];
     }
     
-    async updateText () {
-        return await this.editText(this.searchItem.imageDescription, {
+    
+    async update () {
+        return await this.editText(this.markdownText, {
             inlineKeyboard: await this.getKeyboard()
         });
-    }
-
-    async updateButtons () {
-        return await this.updateInlineKeyboard(await this.getKeyboard());
     }
 
 
     async send () {
-        this.data = await this.chat.sendText(this.searchItem.imageDescription, {
+        this.data = await this.chat.sendText(this.markdownText, {
             inlineKeyboard: await this.getKeyboard()
         });
+    }
+
+    async edit() {
+        this.inEdit = true;
+        this.chat.startThread(EditSearchItemThread, this.searchItem).finally(() => {
+            this.inEdit = false
+            this.update().catch(error => console.error("Error updating #2 description message", error));
+        });
+        this.update().catch(error => console.error("Error updating #1 description message", error));
     }
 }
