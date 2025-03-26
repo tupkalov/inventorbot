@@ -1,23 +1,32 @@
 import { AbstractThread } from 'telegramthread';
+import DescriptionMessage from '../models/DescriptionMessage.js';
 
 export default class EditSearchItemThread extends AbstractThread {
     async processing(searchItem, getNextMessage) {
+        const stop = () => {
+            searchItem.forget()
+            this.stop()
+        }
+
         searchItem.edit();
 
-        searchItem.once('save', () => {
-            this.stop()
-        });
-        var aiDialog;
+        this.once('stop', stop);
+        searchItem.once('save', stop);
+        searchItem.once('delete', stop);
 
         while (true) {
-            const editMessage = await getNextMessage(); // getNextMessage выкинет завершение диалога если начнется новый в этом чате
-            if (!aiDialog) {
-                aiDialog = await searchItem.getImageDescriptionDialog();
-            }
+            const editMessage = await getNextMessage({
+                image: true,
+                text: true
+            });
 
-            const searchItemData = await aiDialog.askWith(`Внеси изменения в твое описание фото в соответствии со следующими инструкциями: \n${editMessage.text}`);
+            DescriptionMessage.deactivateOldMessages().catch(error => {
+                console.error("Error deactivating old messages", error)
+            });
 
-            await searchItem.updateByData(searchItemData);
+            searchItem.editByMessage(editMessage).catch(error => {
+                console.error("Error in editByMessage", error);
+            });
         }
     }
 }

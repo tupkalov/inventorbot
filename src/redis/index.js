@@ -1,3 +1,2 @@
-export { default as redisClient } from './redisClient.js';
-export { default as getPlaces } from './getPlaces.js';
-export { default as emitter } from './emitter.js';
+export { default as redisClient, redisConnected } from './redisClient.js';
+export * as placesController from './placesController.js';

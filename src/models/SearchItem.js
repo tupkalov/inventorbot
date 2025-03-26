@@ -1,23 +1,51 @@
 import DescriptionMessage from "./DescriptionMessage.js";
 import { EventEmitter } from 'node:events';
 import { imageDescriptionVectorStore, imageVectorStore } from '../ai/VectorStore.js';
-import { getPlaces } from '../redis/index.js';
-import { ToolInputParsingException } from "@langchain/core/tools";
-import { ImageDescriptionDialog } from '../ai/AI.js';
-import { ObjectId } from "telegramthread";
+import { placesController, redisConnected } from '../redis/index.js';
+import { ObjectId, MessageError } from "telegramthread";
+import { HumanMessage, AIMessage, default as AI } from "../ai/AI.js";
+
+
+var lastPlace = null
+function saveLastPlace(place) {
+    return placesController.saveLastPlace(lastPlace = place);
+}
+
+// Загрузка последнего места
+redisConnected.then(async () => {
+    lastPlace = await placesController.getLastPlace();
+});
 
 export default class SearchItem extends EventEmitter {
-    constructor (fileId, pageContent, { metadata, saved, url }) {
+    constructor (id, pageContent, fileIds) {
         super();
+        if (!id) {
+            this._tempId = new ObjectId().toString();
+            return; // blank models
+        }
+        this.id = id;
 
-        if (typeof saved !== "boolean") throw new Error("options.saved is required");
+        if (!pageContent) throw new Error("pageContent is required");
 
-        this.updateByData(pageContent, { metadata, fileId, updateMessages: false });
+        switch (true) {
+        case Array.isArray(fileIds):
+            this.fileIds = fileIds;
+            break;
+        case typeof fileIds === "string":
+            this.fileIds = [fileIds];
+            break;
+        default: // blank models
+            throw new Error("fileIds is required");
+        }
 
-        Object.assign(this, { saved, url });
+        this.updateByData(pageContent, { fileIds, updateMessages: false })
+            .catch(error => {
+                console.error("Error in SearchItem constructor", error);
+                this.emit('error', error);
+            });
     }
 
-    async updateByData (pageContent, { metadata, fileId, updateMessages = ToolInputParsingException } = {}) {
+    async updateByData (pageContent, { fileIds } = {}) {
         if (typeof pageContent === "string") {
             // Пытаемся вынуть JSON из строки
             try {
@@ -29,12 +57,9 @@ export default class SearchItem extends EventEmitter {
             this.data = pageContent;
         }
 
-        if (metadata?.id) this.id = metadata.id;
-        if (!this.id) this.id = new ObjectId().toString();
+        await saveLastPlace(this.data.place);
 
-        if (metadata?.fileId || fileId) this.fileId = metadata?.fileId || fileId;
-
-        if (updateMessages) await this.updateMessages();
+        if (fileIds) this.fileIds = fileIds;
     }
 
     toJSON () {
@@ -44,16 +69,24 @@ export default class SearchItem extends EventEmitter {
         };
     }
 
+    isNew () {
+        return !this.id;
+    }
+
     get bot() {
         return global.bot
     }
 
     get metadata () {
-        return { fileId: this.fileId, id: this.id };
+        return { fileIds: this.fileIds, id: this._tempId || this.id };
     }
 
     get place () {
         return this.data.place;
+    }
+
+    get fileId () {
+        throw new Error("Not implemented using FILE_ID");
     }
 
     set place (place) {
@@ -90,12 +123,21 @@ export default class SearchItem extends EventEmitter {
         return descriptionText;
     }
 
-    async getUrl () {
-        return this.url || (this.url = await this.bot.getFileLink(this.fileId));
+    async getUrls () {
+        return this.urls || (this.urls = await Promise.all(this.fileIds.map((fileId) => this.bot.getFileLink(fileId))));
     }
 
     edit() {
         this.inEdit = true;
+    }
+
+    stopEdit() {
+        this.inEdit = false;
+    }
+    forget() {
+        this.stopEdit();
+        this.dropEdits();
+        if (!this.isNew()) this.constructor.map.delete(this.id);
     }
 
     // Список всех мест даже если нет в базе выбранной
@@ -104,7 +146,7 @@ export default class SearchItem extends EventEmitter {
         if (this.place) {
             places.add(this.place);
         }
-        for (let place of await getPlaces()) {
+        for (let place of await placesController.get()) {
             places.add(place);
         }
         return [...places]
@@ -112,17 +154,20 @@ export default class SearchItem extends EventEmitter {
 
     // Зафетчить актуальную инфу из редиса
     async fetchData () {
-        const [ searchItemData ] = await imageDescriptionVectorStore.getByFileIds([this.fileId]);
+        const [ searchItemData ] = await imageDescriptionVectorStore.getByFileIds(this.fileIds);
         if (!searchItemData) {
-            throw MessageError(`FileId in imageDescriptionVectorStore not found: ${this.fileId}`, { clientMessage: "Изображение не найдено" });
+            throw MessageError(`FileId in imageDescriptionVectorStore not found: ${this.fileIds}`, { 
+                info: { fileIds: this.fileIds },
+                clientMessage: "Изображение не найдено"
+            });
         }
 
-        this.updateByData(searchItemData.pageContent, searchItemData.metadata);
+        await this.updateByData(searchItemData.pageContent, searchItemData.metadata);
     }
     
     async savePlace (place) {
 
-        if (this.saved) {
+        if (!this.isNew()) {
             await this.fetchData();
             this.place = place;
             this.save();
@@ -133,93 +178,128 @@ export default class SearchItem extends EventEmitter {
         await this.updateMessages()
     }
 
+    async sendPhotos (chat) {
+        await chat.sendMediaGroup(this.fileIds.map((fileId) => ({
+            type: 'photo',
+            media: fileId
+        })));
+    }       
+
     // Создание нового описани, отправка и сохранение ссылки в кэше
-    async sendDescriptionTo (chat) {
-        const descriptionMessage = new DescriptionMessage({}, { chat, searchItem: this });
+    async sendDescription (chat) {
+        await DescriptionMessage.deactivateOldMessages();
+        
+        const descriptionMessage = this.lastMessage = new DescriptionMessage(this, { chat });
 
         // Список всех описаний для данного файла
-        this.constructor.addDescriptionMessage(descriptionMessage);
         await descriptionMessage.send();
         return descriptionMessage;
     }
 
-    async sendPhoto (chat) {
-        await chat.sendPhoto(this.fileId);
+    async save () {
+        if (!this._savePromise) {
+            this._savePromise = this._save().finally(() => delete this._savePromise);
+        }
+        return this._savePromise;
     }
 
-    async save () {
-        if (!this.saved) return this.saveNew();
+    async _save() {
+        if (this.isNew()) return this.saveNew();
         
-        await imageDescriptionVectorStore.save(this.fileId, this.toJSON());
+        console.log("Save", this.id);
+        await imageDescriptionVectorStore.save(this.id, this.toJSON());
+
+        // Сохранение доп изображений
+        if (this._needToSaveFileIds) {
+            for (const fileId of this._needToSaveFileIds) {
+                console.log("Get fileLink new image", fileId);
+                const imageUrl = await this.bot.getFileLink(fileId);
+                console.log("Save new image", fileId, imageUrl);
+                await imageVectorStore.save(this.id, { pageContent: imageUrl, metadata: { fileId, id: this.id } });
+            }
+            delete this._needToSaveFileIds;
+        }
+        
+        console.log("Save done", this.id);
         this.emit('save');
 
         await this.updateMessages();
     }
 
     async saveNew () {
-        if (this.saved) throw new Error("Already saved");
+        if (!this.isNew())
+            throw new Error("Already saved");
 
-        const newData = await imageDescriptionVectorStore.saveNew(this.fileId, this.toJSON());
-        this.updateByData(newData.pageContent, { metadata: newData.metadata });
+        console.log("Save new started", this._tempId);
+        const newData = await imageDescriptionVectorStore.saveNew(this._tempId, this.toJSON());
+        await this.updateByData(newData.pageContent, { metadata: newData.metadata });
+        
+        for (const fileId of this.fileIds) {
+            console.log("Save new image", fileId);
+            const imageUrl = await this.bot.getFileLink(fileId);
+            await imageVectorStore.saveNew(this._tempId, { pageContent: imageUrl, metadata: { fileId, id: this._tempId } });
+        }
+        
+        this.id = this._tempId;
+        delete this._tempId;
 
-        const imageUrl = await this.bot.getFileLink(this.fileId);
-        await imageVectorStore.saveNew(this.fileId, { pageContent: imageUrl, metadata: { fileId: this.fileId } });
-
-
-        this.saved = true;
         this.emit('save');
 
         await this.updateMessages();
     }
 
     async delete () {
-        await imageDescriptionVectorStore.deleteByFileId(this.fileId);
-        await imageVectorStore.deleteByFileId(this.fileId);
-        this.saved = false;
+        if (!this.isNew()) {
+            await imageDescriptionVectorStore.deleteByKey(this.id);
+            await imageVectorStore.deleteByKey(this.id);
+        }
+        this.deleted = true;
 
         await this.updateMessages();
-    }
-    
-
-
-    static descriptionMap = new Map();
-
-    // Сохранение в кэш
-    static addDescriptionMessage(description) {
-        const stack = this.getDescriptionMessages(description.fileId);
-        stack.push(description);
-        return stack;
+        this.emit('delete');
     }
 
     // Получение из кэша
-    static getDescriptionMessages(fileId) {
-        var stack = this.descriptionMap.get(fileId);
-        if (!stack) {
-            this.descriptionMap.set(fileId, stack = []);
-        }
-        return stack;
+    getDescriptionMessages() {
+        return [ this.lastMessage ]
     }
 
     static map = new Map();
 
     static builder ({ metadata, pageContent }) {
-        const fileId = metadata.fileId;
-        var searchItem = this.map.get(fileId);
+        const id = metadata.id
+        var searchItem = this.map.get(id);
         if (!searchItem) {
-            searchItem = new this(fileId, pageContent, { metadata, saved: true });
-            this.map.set(fileId, searchItem);
+            let fileIds;
+            if (metadata.fileIds) {
+                fileIds = metadata.fileIds;
+            } else if (metadata.fileId) {
+                fileIds = [metadata.fileId];
+            } else throw new Error("metadata.fileId is required");
+
+            searchItem = new this(metadata.id || fileIds[0], pageContent, fileIds);
+            this.map.set(id, searchItem);
         }
+        
         return searchItem;
     }
 
-    updateMessages () {
-        return Promise.all(this.constructor.getDescriptionMessages(this.fileId).map(
-            (descriptionMessage) => descriptionMessage.update()
-        ));
+    static getById (id) {
+        return this.map.get(id);
     }
 
-    async getImageDescriptionDialog() {
-        return new ImageDescriptionDialog(await this.getUrl(), { result: JSON.stringify(this.data) });
+    static async fetchById (id) {
+        const result = await imageDescriptionVectorStore.getByKey(id);
+        return this.builder(result);
+    }
+
+    updateMessages () {
+        return Promise.all(this.getDescriptionMessages().map(
+            descriptionMessage => {
+                if (this.deleted) descriptionMessage.deactivate()
+                return descriptionMessage.update()
+            }
+        ));
     }
 
     getMediaPhoto(options) {
@@ -230,8 +310,175 @@ export default class SearchItem extends EventEmitter {
 
         return {
             type: 'photo',
-            media: this.fileId,
+            media: this.fileIds[0],
             caption
         };
+    }
+
+
+    // На вход сообщение которое запускает генерацию изменений
+    async editByMessage(message) {
+        try {
+            // Добавляем правки для следующего запроса
+            if (message.isPhoto()) {
+                const fileId = message.getLastPhoto().file_id;
+                const url = await this.bot.getFileLink(fileId);
+                this.addEditPhoto(fileId, url, message.caption);
+            } else if (message.text) {
+                this.addEditText(message.text);
+            } else {
+                throw new Error("Not implemented typeof message");
+            }
+
+            // Отправляем и ждем инфы
+            await this.generateDescription();
+
+            await this.sendPhotos(message.chat)
+            await this.sendDescription(message.chat)
+        } catch (error) {
+            message.chat.catchError(error);
+        }
+    }
+
+    addEditPhoto(fileId, url, caption) {
+        if (!this.editPhotos) this.editPhotos = [];
+        this.editPhotos.push({ fileId, url, caption });
+    }
+
+    addEditText(text) {
+        if (!this.editTexts) this.editTexts = [];
+        this.editTexts.push(text);
+    }
+
+    dropEdits() {
+        delete this.editPhotos;
+        delete this.editTexts;
+    }
+
+    get onlyPhotoPrompt() {
+        return `Наиболее точно и при этом коротко опиши предмет на фото. 
+        - Используй в описании бренд, модель, применимость, описание если оно есть на изображении
+        - Описание должно содержать все характеристики, которые можно точно увидеть на фото.
+        - В описание добавляй информацию о применении этой вещи о котором тебе известно.
+        - Не описывай окружающие предметы и окружение в целом.
+        ${lastPlace ? `- Если местоположение явно не указано используй предыдущее: ${lastPlace}` : ''}`;
+    }
+    
+    addEditPrompt = "Измени описание в соответствии с новыми данными:";
+
+    abortSignal() {
+        if (this.abortController) this.abortController.abort();
+        this.abortController = new AbortController();
+        return this.abortController.signal;
+    }
+
+
+    async generateDescription() {
+        console.log("generateDescription for", this.id || "new item");
+
+        const getEditMessages = () => {
+            return [
+                ...(this.editPhotos || []).map(({ url, caption }) => [
+                    {
+                        type: "image_url",
+                        image_url: { url }
+                    }, caption && {
+                        type: "text",
+                        text: caption
+                    }
+                ]).flat().filter(Boolean),
+
+                ...(this.editTexts || []).map(text => ({
+                    type: "text",
+                    text
+                }))
+            ]
+        }
+
+
+        const signal = this.abortSignal();
+
+        const dialog = [];
+        var aiMessage;
+
+        if (!this.editPhotos?.length && !this.editTexts?.length) {
+            throw new Error("No photo or text to edit");
+        }
+
+        // Составляем диалог
+        await (async () => {
+            // Либо мы этот айтем достали из базы либо он новый
+            if (!this.dialog) {
+                // Вступительное сообщение
+                const newEditMessage = new HumanMessage({
+                    content: [
+                        { 
+                            type: "text",
+                            text: this.onlyPhotoPrompt
+                        }
+                    ]
+                });
+                dialog.push(newEditMessage);
+
+                // Если новое то просто добавляем правки
+                if (this.isNew()) {
+                    newEditMessage.content.push(...getEditMessages());
+                    // И выходим из генерации диалога т.к. правки добавили
+                    return;
+
+                // Если из базы 
+                } else {
+                    // значит подставляем те фотки которые уже приложены
+                    newEditMessage.content.push(
+                        ...(await Promise.all(this.fileIds
+                                .map(async fileId => this.bot.getFileLink(fileId))))
+                                .map(url => ({
+                                    type: "image_url",
+                                    image_url: { url }
+                                })));
+                    
+                    // И добавляем сгенерированое старое описание
+                    dialog.push(new AIMessage({ content: JSON.stringify(this.data) }));
+                }
+                
+            // Если диалог уже есть то добавляем его в начало
+            } else {
+                dialog.push(...this.dialog);
+            }
+
+            // если правки не добавлены то добавляем их с редактируемым сообщением
+            dialog.push(
+                new HumanMessage({
+                    content: [
+                        {
+                            type: "text",
+                            text: this.addEditPrompt
+                        },
+                        ...getEditMessages()
+                    ]
+                })
+            );
+        })();
+
+        aiMessage = await AI.getImageDescription(dialog, { signal });
+
+        this.dialog = [...dialog, aiMessage];
+
+        // Добавление в список на сохранение фото которые не были сохранены
+        if (!this._needToSaveFileIds) this._needToSaveFileIds = [];
+        this.editPhotos?.forEach(({ fileId }) => {
+            if (!this.fileIds?.includes(fileId)) {
+                this._needToSaveFileIds.push(fileId);
+            }
+        });
+
+        await this.updateByData(aiMessage.content, {
+            fileIds: [
+                ...(this.fileIds || []), 
+                ...(this.editPhotos  || []).map(({ fileId }) => fileId)
+            ]
+        });
+
+        this.dropEdits();
     }
 }

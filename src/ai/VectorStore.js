@@ -20,6 +20,7 @@ export default class VectorStore {
 
     async saveNew (key, { pageContent, metadata }) {
         await this.instance.addDocuments([{
+            id: key,
             metadata,
             pageContent: typeof pageContent !== "string" ? JSON.stringify(pageContent) : pageContent,
         }], {
@@ -42,6 +43,7 @@ export default class VectorStore {
     async save (key, { metadata, pageContent }) {
         await redisClient.HSET(`doc:${this.indexName}:${key}`, 'metadata', this.instance.escapeSpecialChars(JSON.stringify(metadata)));
         await redisClient.HSET(`doc:${this.indexName}:${key}`, 'content', JSON.stringify(pageContent));
+        await redisClient.HSET(`doc:${this.indexName}:${key}`, 'id', key);
         return;
     }
 
@@ -59,6 +61,7 @@ export default class VectorStore {
         return results.map(([ doc ]) => doc);
     }
 
+    // TODO зарефакторить
     async getByFileIds (fileIds) {
         const keys = fileIds.map((fileId) => `doc:${this.indexName}:${fileId}`);
         const docs = await Promise.all(keys.map(key => redisClient.HGETALL(key)));
@@ -70,8 +73,17 @@ export default class VectorStore {
         });
     }
 
-    async deleteByFileId (fileId) {
-        await redisClient.DEL(`doc:${this.indexName}:${fileId}`);
+    async deleteByKey (key) {
+        await redisClient.DEL(`doc:${this.indexName}:${key}`);
+    }
+
+    async getByKey (key) {
+        const doc = await redisClient.HGETALL(`doc:${this.indexName}:${key}`);
+        if (!doc.content) return null;
+        return {
+            metadata: JSON.parse(this.instance.unEscapeSpecialChars(doc.metadata)),
+            pageContent: JSON.parse(doc.content)
+        }
     }
 }
 

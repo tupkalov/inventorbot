@@ -1,4 +1,4 @@
-import { AbstractThread, utils } from 'telegramthread';
+import { AbstractThread, utils, MessageError } from 'telegramthread';
 
 import { imageDescriptionVectorStore, imageVectorStore } from '../ai/VectorStore.js';
 import { SearchItem } from '../models/index.js';
@@ -35,15 +35,21 @@ export default class SearchThread extends AbstractThread {
                 return searchItem.getMediaPhoto({ caption: text => `${index+1}. ${text}` })
             })
         );
-        await this.chat.sendText("Выберите результат для просмотра",
-            {
-                inlineKeyboard: utils.createInlineRows(searchItems.map((searchItem, index) => ({
-                    text: `${index+1}. ${searchItem.shortName || ''}`.trim(),
-                    action: async () => {
-                        await searchItem.sendPhoto(this.chat);
-                        await searchItem.sendDescriptionTo(this.chat);
-                    }
-                })))
-            });
+        const inlineKeyboard = utils.createInlineRows(searchItems.map((searchItem, index) => ({
+            text: `${index+1}. ${searchItem.shortName || ''}`.trim(),
+            callbackKey: `si_${searchItem.id}`,
+            /* action: async () => {
+                await searchItem.sendPhotos(this.chat);
+                await searchItem.sendDescription(this.chat);
+            } */
+        })));
+
+        await this.chat.sendText("Выберите результат для просмотра", { inlineKeyboard })
+            .catch(error => {
+                throw new MessageError("SearchThread:ErrorSendingSearchResults", { error,
+                    info: { searchItems, inlineKeyboard }
+                });
+            })
+
     }
 }
